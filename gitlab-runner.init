@@ -1,0 +1,93 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+
+packages:
+  - git
+  - docker.io
+  - tig
+  - htop
+  - fail2ban
+
+groups:
+  - docker
+
+system_info:
+  default_user:
+    groups: [docker]
+
+#Add SSH Keys
+ssh_authorized_keys:
+- ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDfs6VHis9uJFVeBlBEE3Cf0bILiAfzjXbUowPCy9Amc lucas
+
+write_files:
+#Regiter GitLab-Runner with your GitLab instance and organization
+- owner: root:root
+  path: /root/register.sh
+  content: |
+    gitlab-runner register \
+      --non-interactive \
+      --url "https://gitlab.com/" \
+      --registration-token "YourOwnToken" \
+      --executor "docker" \
+      --docker-image docker:latest \
+      --docker-privileged \
+      --docker-volumes "/certs/client" \
+      --description "gitlab-runner" \
+      --tag-list "docker" \
+      --run-untagged="true" \
+      --locked="false"
+#Expose Prometheus for GitLab-Runner (optional)
+- owner: root:root
+  path: /etc/gitlab-runner/config.toml
+  content: |
+    listen_address = ":9252"
+#Systemd files to automatically remove old docker images
+- owner: root:root
+  path: /etc/systemd/system/docker-cleaner.service
+  content: |
+    [Unit]
+    Description=Remove old Docker images and volumes
+    Wants=docker-cleaner.timer
+    [Service]
+    ExecStartPre=/bin/bash -c "yes | /usr/bin/docker container prune"
+    ExecStart=/bin/bash -c "/usr/bin/docker volume ls -qf dangling=true | xargs -r /usr/bin/docker volume rm"
+    ExecStartPost=/bin/bash -c "/usr/bin/docker image ls -qf dangling=true | xargs -r /usr/bin/docker rmi -f"
+    ExecStartPost=/bin/bash -c "/usr/bin/docker images node | grep 'months ago' | awk '{print $3}' | xargs -r /usr/bin/docker rmi -f"
+    [Install]
+    WantedBy=multi-user.target
+- owner: root:root
+  path: /etc/systemd/system/docker-cleaner.timer
+  content: |
+    [Unit]
+    Description=Run docker-cleaner every 24h
+    Requires=docker-cleaner.service
+    [Timer]
+    Unit=docker-cleaner.service
+    OnBootSec=5min
+    OnUnitActiveSec=24h
+    [Install]
+    WantedBy=timers.target
+
+runcmd:
+#Install GitLab-Runner
+- curl -L https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh | bash
+- apt-get update
+- apt-get install -y gitlab-runner
+
+#Add gitlab-runner user to Docker group
+- usermod -aG docker gitlab-runner
+
+#Register the new Runner to your GitLab organization
+- /bin/bash /root/register.sh
+- gitlab-runner verify
+
+#Make sure disk doesn't fill up
+- systemctl, daemon-reload
+- systemctl, enable, docker-cleaner.service
+- systemctl, enable, docker-cleaner.timer
+- systemctl, start, docker-cleaner.timer
+
+#Enable auto-update for GitLab-Runner package
+- sed -i '/^Unattended-Upgrade::Allowed-Origins {/a\'$'\n'' "packages.gitlab.com/runner/gitlab-runner:${distro_codename}";' /etc/apt/apt.conf.d/50unattended-upgrades
